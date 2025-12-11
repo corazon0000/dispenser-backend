@@ -5,6 +5,7 @@ const midtransClient = require('midtrans-client');
 const mqtt = require('mqtt');
 const cors = require('cors');
 const crypto = require('crypto');
+const mysql = require('mysql2/promise');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -18,40 +19,61 @@ app.use(cors({
 app.use(bodyParser.json());
 
 // =============================
+// Koneksi Database MariaDB
+// =============================
+let db;
+(async () => {
+    try {
+        db = await mysql.createConnection({
+            host: process.env.DB_HOST,
+            user: process.env.DB_USER,
+            password: process.env.DB_PASSWORD,
+            database: process.env.DB_NAME,
+        });
+
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                order_id VARCHAR(100),
+                item_name VARCHAR(100),
+                price INT,
+                status VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        console.log('✅ Database connected & ready (transactions table)');
+    } catch (err) {
+        console.error('❌ Database connection failed:', err.message);
+    }
+})();
+
+// =============================
 // Midtrans Snap client
 // =============================
 const snap = new midtransClient.Snap({
-    isProduction: true,
+    isProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
     serverKey: process.env.MIDTRANS_SERVER_KEY
 });
 
 // =============================
-// MQTT client (Publish Only) dengan reconnect
+// MQTT client (Publish Only)
 // =============================
 let mqttClient = null;
 const mqttOptions = {
     username: process.env.MQTT_USERNAME,
     password: process.env.MQTT_PASSWORD,
-    reconnectPeriod: 5000, // coba reconnect setiap 5 detik
+    reconnectPeriod: 5000,
     rejectUnauthorized: true
 };
 
 function connectMQTT() {
     mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL, mqttOptions);
 
-    mqttClient.on('connect', () => {
-        console.log('✅ Connected to MQTT broker (Publish Only)');
-    });
-
-    mqttClient.on('error', (error) => {
-        console.error('❌ MQTT connection error:', error.message);
-    });
-
-    mqttClient.on('close', () => {
-        console.warn('⚠️ MQTT disconnected, trying to reconnect...');
-    });
+    mqttClient.on('connect', () => console.log('✅ Connected to MQTT broker'));
+    mqttClient.on('error', (err) => console.error('❌ MQTT error:', err.message));
+    mqttClient.on('close', () => console.warn('⚠️ MQTT disconnected, reconnecting...'));
 }
-
 connectMQTT();
 
 // =============================
@@ -60,7 +82,7 @@ connectMQTT();
 const orderMap = {};
 
 // =============================
-// Queue MQTT
+// MQTT Queue System
 // =============================
 const mqttQueue = [];
 let isProcessingQueue = false;
@@ -77,19 +99,17 @@ function processQueue() {
         mqttClient.publish(topic, message, { qos: 1 }, (error) => {
             if (error) {
                 console.error('❌ MQTT publish error:', error.message);
-                // retry lagi di akhir queue
                 mqttQueue.push({ order_id, status, relay });
             } else {
-                console.log(`📤 Published to ${topic}: ${message}`);
+                console.log(`📤 MQTT Sent: ${message}`);
             }
             isProcessingQueue = false;
-            setImmediate(processQueue); // langsung proses item berikutnya
+            setImmediate(processQueue);
         });
     } else {
-        // Kalau belum connect, push kembali ke queue
         mqttQueue.push({ order_id, status, relay });
         isProcessingQueue = false;
-        setTimeout(processQueue, 1000); // coba lagi 1 detik kemudian
+        setTimeout(processQueue, 1000);
     }
 }
 
@@ -114,7 +134,7 @@ function verifyMidtransSignature(notification) {
 }
 
 // =============================
-// Endpoint create transaction
+// Endpoint: Buat Transaksi
 // =============================
 app.post('/create-transaction', async (req, res) => {
     try {
@@ -134,6 +154,13 @@ app.post('/create-transaction', async (req, res) => {
         };
 
         const transaction = await snap.createTransaction(parameter);
+
+        // Simpan ke database
+        await db.query(
+            `INSERT INTO transactions (order_id, item_name, price, status) VALUES (?, ?, ?, ?)`,
+            [orderId, item_name, price, 'pending']
+        );
+
         res.json({ token: transaction.token, order_id: orderId });
         console.log(`✅ Transaction created: ${orderId} → ${item_name}`);
     } catch (error) {
@@ -143,51 +170,66 @@ app.post('/create-transaction', async (req, res) => {
 });
 
 // =============================
-// Endpoint midtrans notification
+// Endpoint: Midtrans Notification
 // =============================
 app.post('/midtrans-notification', async (req, res) => {
     try {
         const notification = req.body;
         const { order_id, transaction_status, fraud_status } = notification;
-        const item_name = orderMap[order_id] || 'TEST_MODE';
+        const item_name = orderMap[order_id] || 'Unknown';
 
-        console.log(`🔔 Midtrans Notification → Order: ${order_id}, Status: ${transaction_status}, Item: ${item_name}`);
-
-        if (item_name === 'TEST_MODE') {
-            console.log('⚡ Test URL Notification diterima.');
-            return res.status(200).send('OK (Test Notification)');
-        }
+        console.log(`🔔 Midtrans Notification: ${order_id} | Status: ${transaction_status}`);
 
         if (!verifyMidtransSignature(notification)) {
             console.error(`❌ Invalid signature for order_id: ${order_id}`);
             return res.status(400).json({ error: 'Invalid signature' });
         }
 
+        let newStatus = transaction_status;
         let relay = null;
+
         if (item_name === 'Air Putih') relay = 1;
         else if (item_name === 'Teh') relay = 2;
 
         if ((transaction_status === 'capture' || transaction_status === 'settlement') && (!fraud_status || fraud_status === 'accept')) {
+            newStatus = 'success';
             if (relay) publishToMQTT(order_id, 'on', relay);
-        } else if (transaction_status === 'deny' || transaction_status === 'cancel' || transaction_status === 'expire') {
+        } else if (['deny', 'cancel', 'expire'].includes(transaction_status)) {
+            newStatus = 'failed';
             publishToMQTT(order_id, 'off', 1);
             publishToMQTT(order_id, 'off', 2);
         }
 
-        // Clean up orderMap otomatis kalau status final
-        if (['settlement', 'expire', 'cancel'].includes(transaction_status)) {
-            delete orderMap[order_id];
-        }
+        // Update status ke database
+        await db.query(`UPDATE transactions SET status=? WHERE order_id=?`, [newStatus, order_id]);
 
         res.status(200).send('OK');
     } catch (error) {
         console.error('❌ Error handling notification:', error.message);
-        res.status(500).json({ error: 'Gagal menangani notifikasi', details: error.message });
+        res.status(500).json({ error: 'Gagal menangani notifikasi' });
     }
 });
 
 // =============================
-// Start server
+// Endpoint: Admin lihat transaksi
+// =============================
+app.get('/transactions', async (req, res) => {
+    const token = req.query.admin_token;
+    if (token !== process.env.ADMIN_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    try {
+        const [rows] = await db.query(`SELECT * FROM transactions ORDER BY id DESC`);
+        res.json(rows);
+    } catch (err) {
+        console.error('❌ Database query error:', err.message);
+        res.status(500).json({ error: 'Gagal ambil data transaksi' });
+    }
+});
+
+// =============================
+// Start Server
 // =============================
 app.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
