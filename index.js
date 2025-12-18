@@ -11,6 +11,15 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // =============================
+// Katalog harga (server-side)
+// NOTE: Jangan percaya harga dari frontend.
+// =============================
+const ITEM_CATALOG = {
+    'Air Putih': { price: 100, relay: 1 },
+    'Teh': { price: 100, relay: 2 },
+};
+
+// =============================
 // CORS (frontend only)
 // =============================
 app.use(cors({
@@ -138,18 +147,32 @@ function verifyMidtransSignature(notification) {
 // =============================
 app.post('/create-transaction', async (req, res) => {
     try {
-        const { item_name, price, quantity, customer_details } = req.body;
-        if (!item_name || !price || !quantity || !customer_details) {
+        const { item_name, quantity, customer_details } = req.body;
+        if (!item_name || !quantity || !customer_details) {
             console.error('❌ Invalid request body:', req.body);
             return res.status(400).json({ error: 'Data transaksi tidak lengkap' });
         }
+
+        // Ambil harga dari katalog (bukan dari request)
+        const item = ITEM_CATALOG[item_name];
+        if (!item) {
+            return res.status(400).json({ error: 'Menu tidak valid' });
+        }
+
+        // Pastikan quantity valid
+        const qty = parseInt(quantity, 10);
+        if (!Number.isInteger(qty) || qty <= 0 || qty > 10) {
+            return res.status(400).json({ error: 'Quantity tidak valid' });
+        }
+
+        const price = item.price;
 
         const orderId = `ORDER-${Date.now()}`;
         orderMap[orderId] = item_name;
 
         const parameter = {
-            transaction_details: { order_id: orderId, gross_amount: price * quantity },
-            item_details: [{ id: item_name, price, quantity, name: item_name }],
+            transaction_details: { order_id: orderId, gross_amount: price * qty },
+            item_details: [{ id: item_name, price, quantity: qty, name: item_name }],
             customer_details
         };
 
@@ -186,10 +209,7 @@ app.post('/midtrans-notification', async (req, res) => {
         }
 
         let newStatus = transaction_status;
-        let relay = null;
-
-        if (item_name === 'Air Putih') relay = 1;
-        else if (item_name === 'Teh') relay = 2;
+        const relay = ITEM_CATALOG[item_name]?.relay ?? null;
 
         if ((transaction_status === 'capture' || transaction_status === 'settlement') && (!fraud_status || fraud_status === 'accept')) {
             newStatus = 'success';
